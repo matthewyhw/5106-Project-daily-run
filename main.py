@@ -1,60 +1,317 @@
-# Colab-ready: fetch carpark basic info, parse time-aware hourly prices from remark_en,
-# only extract prices that have a leading '$' (assume HKD) and provide numeric HKD fields.
-import os, time, json, requests, re
+import os
+import time
+import json
+import re
+import math
+import requests
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
-import math
+from datetime import datetime, timedelta
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
-# CONFIG - change paths as needed
+
+# ========================= CONFIG =========================
+VACANCY_API = "https://resource.data.one.gov.hk/td/carpark/vacancy_all.json"
 CARPARK_INFO_API = "https://resource.data.one.gov.hk/td/carpark/basic_info_all.json"
-FLATTENED_CSV_PATH = "/content/carpark_output/carpark_vacancy_28days_flat.csv"  # adjust if needed
-OUTPUT_DIR = "/content/carpark_output_merged"
-MERGED_CSV = os.path.join(OUTPUT_DIR, "carpark_vacancy_28days_merged.csv")
-PER_DAY_DIR = os.path.join(OUTPUT_DIR, "per_day")
-CACHE_DIR = os.path.join(OUTPUT_DIR, "cache")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(PER_DAY_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Dry run controls
-DRY_RUN = True
-DRY_MAX_PARKS = 20
+DAYS = 28
+INTERVAL_MINUTES = 30
+
+DRY_RUN = True          # 測試時 True，上 GitHub 想抓全量就改 False
+LIMIT_SNAPSHOTS = 6     # DRY_RUN 時只抓最後 N 個時間點
+DRY_MAX_PARKS = 20      # DRY_RUN 時只保留部分 car park
+
 REQUEST_SLEEP = 0.1
 
-# Requested columns (keeps 'price' summary); we'll add numeric HKD columns
-columns_needed = [
-    'park_id', 'name_en', 'displayAddress_en', 'latitude', 'longitude',
-    'district_en', 'contactNo', 'opening_status', 'carpark_photo', 'price'
-]
+VACANCY_CACHE_DIR = "./carpark_cache"
+INFO_CACHE_DIR = "./carpark_merge_cache"
+os.makedirs(VACANCY_CACHE_DIR, exist_ok=True)
+os.makedirs(INFO_CACHE_DIR, exist_ok=True)
 
+SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
+SHEET_NAME = "data"
+
+# ========================= 共用 requests session =========================
 session = requests.Session()
-session.headers.update({"User-Agent":"colab-carpark-merge/1.0"})
+session.headers.update({"User-Agent": "carpark-collector-merge/1.0"})
 
-def get_with_retry(url, params=None, tries=3, timeout=30, backoff=1.0):
+def get_with_retry(url, params=None, timeout=30, tries=3, backoff=1.0):
     last_exc = None
-    for i in range(tries):
+    for attempt in range(tries):
         try:
             r = session.get(url, params=params, timeout=timeout)
             r.raise_for_status()
             return r
         except Exception as e:
             last_exc = e
-            time.sleep(backoff*(1+i))
-    raise last_exc
+            if attempt == tries - 1:
+                break
+            time.sleep(backoff * (1 + attempt))
+    if last_exc:
+        raise last_exc
 
-def fetch_and_cache_info(use_cache=True):
-    cache_file = os.path.join(CACHE_DIR, "carpark_basic_info.json")
-    if use_cache and os.path.exists(cache_file):
+# ========================= vacancy：時間序列抓取 =========================
+def round_down_to_half_hour(dt):
+    minute = 0 if dt.minute < 30 else 30
+    return dt.replace(minute=minute, second=0, microsecond=0)
+
+def generate_timestamps(days=DAYS):
+    end = round_down_to_half_hour(datetime.utcnow())
+    start = end - timedelta(days=days)
+    ts = []
+    cur = start
+    while cur <= end:
+        ts.append(cur)
+        cur += timedelta(minutes=INTERVAL_MINUTES)
+    return ts
+
+def vacancy_cache_path(ts):
+    return os.path.join(VACANCY_CACHE_DIR, ts.strftime("%Y%m%d%H%M") + ".json")
+
+def try_direct_api(ts):
+    formats = [
+        lambda d: d.strftime("%Y-%m-%dT%H:%M:%S"),
+        lambda d: d.strftime("%Y%m%d%H%M%S"),
+        lambda d: d.strftime("%Y-%m-%dT%H:%M"),
+    ]
+    param_names = ["t", "time", "timestamp", "date"]
+
+    for fmt in formats:
+        s = fmt(ts)
+        for p in param_names:
+            try:
+                r = get_with_retry(VACANCY_API, params={p: s}, tries=2)
+                if r and r.text.strip():
+                    content_type = r.headers.get('content-type', '')
+                    if r.text.strip().startswith(('{', '[')) or 'json' in content_type:
+                        return r.text
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    try:
+        r = get_with_retry(VACANCY_API, tries=2)
+        if r and r.text.strip():
+            return r.text
+    except Exception:
+        pass
+    return None
+
+def try_wayback(ts):
+    try:
+        ts_str = ts.strftime("%Y%m%d%H%M%S")
+        r = get_with_retry(
+            "http://archive.org/wayback/available",
+            params={"url": VACANCY_API, "timestamp": ts_str},
+            tries=3,
+        )
+        j = r.json()
+        snap = j.get("archived_snapshots", {}).get("closest")
+        if not snap or not snap.get("available"):
+            return None
+        snap_url = snap["url"]
+        r2 = get_with_retry(snap_url)
+        txt = r2.text
+        start = min(i for i in (txt.find("{"), txt.find("[")) if i != -1)
+        return txt[start:]
+    except Exception:
+        return None
+
+def fetch_snapshot(ts):
+    cache_file = vacancy_cache_path(ts)
+    if os.path.exists(cache_file):
         with open(cache_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    r = get_with_retry(CARPARK_INFO_API, tries=3)
-    j = r.json()
-    with open(cache_file, "w", encoding="utf-8") as f:
-        json.dump(j, f, ensure_ascii=False)
-    return j
+            return f.read()
 
-# Helpers for parsing
+    txt = try_direct_api(ts) or try_wayback(ts)
+    if txt:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return txt
+    return None
+
+def flatten_carpark_record(rec, snapshot_ts):
+    rows = []
+    raw_json = json.dumps(rec, ensure_ascii=False)
+
+    park_id = None
+    for key in ("park_id", "ParkID", "carpark_id", "carpark_no", "id"):
+        if key in rec:
+            park_id = rec[key]
+            break
+    if park_id is None:
+        for k in rec:
+            if "park" in k.lower() or ("id" in k.lower() and len(k) <= 10):
+                park_id = rec.get(k)
+                break
+
+    vehicle_types = rec.get("vehicle_type") or rec.get("vehicleType") or []
+    if not isinstance(vehicle_types, list):
+        vehicle_types = [vehicle_types] if vehicle_types else []
+
+    if not vehicle_types:
+        rows.append({
+            "snapshot_requested_utc": snapshot_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "park_id": park_id,
+            "vehicle_type": None,
+            "service_category": None,
+            "vacancy_type": None,
+            "vacancy": None,
+            "lastupdate": None,
+            "raw_json": raw_json
+        })
+        return rows
+
+    for vt in vehicle_types:
+        vt_type = vt.get("type") if isinstance(vt, dict) else str(vt)
+
+        service_cats = []
+        if isinstance(vt, dict):
+            service_cats = vt.get("service_category") or vt.get("serviceCategory") or []
+        if not isinstance(service_cats, list):
+            service_cats = [service_cats] if service_cats else []
+
+        if not service_cats:
+            rows.append({
+                "snapshot_requested_utc": snapshot_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "park_id": park_id,
+                "vehicle_type": vt_type,
+                "service_category": None,
+                "vacancy_type": None,
+                "vacancy": None,
+                "lastupdate": None,
+                "raw_json": raw_json
+            })
+            continue
+
+        for sc in service_cats:
+            if not isinstance(sc, dict):
+                rows.append({
+                    "snapshot_requested_utc": snapshot_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "park_id": park_id,
+                    "vehicle_type": vt_type,
+                    "service_category": str(sc),
+                    "vacancy_type": None,
+                    "vacancy": None,
+                    "lastupdate": None,
+                    "raw_json": raw_json
+                })
+                continue
+
+            category = sc.get("category") or sc.get("service") or sc.get("type")
+            vacancy_type = sc.get("vacancy_type") or sc.get("vacancyType")
+            vacancy_raw = sc.get("vacancy")
+            lastupdate = sc.get("lastupdate") or sc.get("last_update")
+
+            try:
+                vacancy = int(vacancy_raw) if vacancy_raw not in (None, "", "N/A") else None
+            except Exception:
+                vacancy = None
+
+            rows.append({
+                "snapshot_requested_utc": snapshot_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "park_id": park_id,
+                "vehicle_type": vt_type,
+                "service_category": category,
+                "vacancy_type": vacancy_type,
+                "vacancy": vacancy,
+                "lastupdate": lastupdate,
+                "raw_json": raw_json
+            })
+    return rows
+
+def build_vacancy_df():
+    print("Generating timestamps...")
+    timestamps = generate_timestamps(DAYS)
+    if DRY_RUN:
+        timestamps = timestamps[-LIMIT_SNAPSHOTS:]
+        print(f"DRY_RUN enabled: using last {LIMIT_SNAPSHOTS} timestamps only")
+
+    print(f"Fetching data for {len(timestamps)} timestamps...")
+
+    all_rows = []
+    failed_timestamps = []
+
+    for i, ts in enumerate(timestamps):
+        if (i + 1) % 50 == 0 or i < 10 or i == len(timestamps) - 1:
+            print(f"  → Processed {i + 1}/{len(timestamps)} timestamps...")
+
+        data = fetch_snapshot(ts)
+        if not data:
+            failed_timestamps.append(ts)
+            continue
+
+        try:
+            parsed = json.loads(data)
+        except Exception:
+            start = min([i for i in (data.find("{"), data.find("[")) if i >= 0] or [0])
+            try:
+                parsed = json.loads(data[start:])
+            except Exception:
+                failed_timestamps.append(ts)
+                continue
+
+        records = []
+        if isinstance(parsed, list):
+            records = parsed
+        elif isinstance(parsed, dict):
+            for key in ("car_park", "data", "records", "results", "carparks", "items"):
+                if key in parsed and isinstance(parsed[key], list):
+                    records = parsed[key]
+                    break
+
+        if not records:
+            def find_lists(obj):
+                best = []
+                if isinstance(obj, list) and len(obj) > len(best) and all(isinstance(x, dict) for x in obj[:5]):
+                    best = obj
+                elif isinstance(obj, dict):
+                    for v in obj.values():
+                        sub = find_lists(v)
+                        if len(sub) > len(best):
+                            best = sub
+                elif isinstance(obj, list):
+                    for item in obj:
+                        sub = find_lists(item)
+                        if len(sub) > len(best):
+                            best = sub
+                return best
+            records = find_lists(parsed)
+
+        if not records:
+            failed_timestamps.append(ts)
+            continue
+
+        for rec in records:
+            try:
+                rows = flatten_carpark_record(rec, ts)
+                all_rows.extend(rows)
+            except Exception:
+                pass
+
+        time.sleep(0.05)
+
+    df = pd.DataFrame(all_rows)
+    if not df.empty:
+        df["snapshot_requested_utc"] = pd.to_datetime(df["snapshot_requested_utc"])
+        df["date"] = df["snapshot_requested_utc"].dt.date
+        df["hour"] = df["snapshot_requested_utc"].dt.hour
+        df["minute"] = df["snapshot_requested_utc"].dt.minute
+        df = df.sort_values(
+            ["snapshot_requested_utc", "park_id", "vehicle_type", "service_category"]
+        ).reset_index(drop=True)
+
+    print("\nVACANCY SUCCESS!")
+    print(f"DataFrame shape: {df.shape}")
+    print(f"Unique car parks: {df['park_id'].nunique()}")
+    print(f"Date range: {df['date'].min()} to {df['date'].max()}")
+    print(f"Failed timestamps: {len(failed_timestamps)} (out of {len(timestamps)})")
+
+    return df
+
+# ========================= basic info + 價錢解析 =========================
 DAY_NAME_MAP = {
     'mon': 0, 'monday': 0,
     'tue': 1, 'tues': 1, 'tuesday': 1,
@@ -64,6 +321,8 @@ DAY_NAME_MAP = {
     'sat': 5, 'saturday': 5,
     'sun': 6, 'sunday': 6
 }
+
+_money_re = re.compile(r'(?P<cur>HK\$|\$)\s*(?P<amt>\d{1,3}(?:,\d{3})*(?:\.\d+)?)', re.I)
 
 def time_str_to_minutes(s):
     if s is None:
@@ -81,7 +340,7 @@ def time_str_to_minutes(s):
         if len(s) <= 2:
             try:
                 h = int(s); m = 0
-            except:
+            except Exception:
                 return None
         else:
             try:
@@ -89,14 +348,11 @@ def time_str_to_minutes(s):
                     h = int(s[0]); m = int(s[1:])
                 else:
                     h = int(s[:2]); m = int(s[2:])
-            except:
+            except Exception:
                 return None
     if h < 0 or h > 23 or m < 0 or m > 59:
         return None
-    return h*60 + m
-
-# Only match prices that include a leading '$' or 'HK$' -> interpret as HKD
-_money_re = re.compile(r'(?P<cur>HK\$|\$)\s*(?P<amt>\d{1,3}(?:,\d{3})*(?:\.\d+)?)', re.I)
+    return h * 60 + m
 
 def parse_days_fragment(text):
     if not text:
@@ -111,10 +367,16 @@ def parse_days_fragment(text):
     day_tokens = re.findall(r'(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)', t, re.I)
     if not day_tokens:
         return None
-    ranges = re.findall(r'(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)[\s\-–to]+(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)', t, re.I)
+    ranges = re.findall(
+        r'(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)'
+        r'[\s\-–to]+'
+        r'(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)',
+        t, re.I
+    )
     if ranges:
         for a,b in ranges:
-            a_i = DAY_NAME_MAP.get(a[:3].lower()); b_i = DAY_NAME_MAP.get(b[:3].lower())
+            a_i = DAY_NAME_MAP.get(a[:3].lower())
+            b_i = DAY_NAME_MAP.get(b[:3].lower())
             if a_i is not None and b_i is not None:
                 if a_i <= b_i:
                     return list(range(a_i, b_i+1))
@@ -128,10 +390,6 @@ def parse_days_fragment(text):
     return sorted(out) if out else None
 
 def parse_price_schedule(text):
-    """
-    Parse free-form remark text and return list of rules with numeric 'price_hkd' only when $ present.
-    Each rule: {'days': [...], 'start_min': int or None, 'end_min': int or None, 'price_hkd': float or None, 'unit': 'hour'|'flat', 'raw': segment}
-    """
     if not text:
         return []
     s = str(text)
@@ -141,17 +399,21 @@ def parse_price_schedule(text):
         seg = seg.strip()
         if not seg:
             continue
-        # detect free -> keep as None price with free=True
         if re.search(r'\b(free|no charge|complimentary|no fee|free of charge)\b', seg, re.I):
-            rules.append({'days': None, 'start_min': None, 'end_min': None, 'price_hkd': None, 'unit': 'flat', 'free': True, 'raw': seg})
+            rules.append({
+                'days': None, 'start_min': None, 'end_min': None,
+                'price_hkd': None, 'unit': 'flat', 'free': True, 'raw': seg
+            })
             continue
         days = parse_days_fragment(seg)
-        time_match = re.search(r'(?P<start>\d{1,2}:\d{2}|\d{3,4}|\d{1,2})\s*[-–to]{1,3}\s*(?P<end>\d{1,2}:\d{2}|\d{3,4}|\d{1,2})', seg)
+        time_match = re.search(
+            r'(?P<start>\d{1,2}:\d{2}|\d{3,4}|\d{1,2})\s*[-–to]{1,3}\s*'
+            r'(?P<end>\d{1,2}:\d{2}|\d{3,4}|\d{1,2})', seg
+        )
         start_min = end_min = None
         if time_match:
             start_min = time_str_to_minutes(time_match.group('start'))
             end_min = time_str_to_minutes(time_match.group('end'))
-        # Require $ in the segment for price extraction
         m = _money_re.search(seg)
         price_hkd = None
         unit = 'hour' if re.search(r'per hour|/hour|hourly|hr\b', seg, re.I) else 'flat'
@@ -159,28 +421,32 @@ def parse_price_schedule(text):
             amt = m.group('amt').replace(',', '')
             try:
                 price_hkd = float(amt)
-            except:
+            except Exception:
                 price_hkd = None
-        # Only add rule if we found a $ price or a free marker
         if price_hkd is not None:
-            rules.append({'days': days, 'start_min': start_min, 'end_min': end_min, 'price_hkd': price_hkd, 'unit': unit, 'free': False, 'raw': seg})
-        # else skip (do not fallback to numbers without $)
+            rules.append({
+                'days': days,
+                'start_min': start_min,
+                'end_min': end_min,
+                'price_hkd': price_hkd,
+                'unit': unit,
+                'free': False,
+                'raw': seg
+            })
     return rules
 
 def price_for_datetime_from_schedule(schedule, dt):
     if not schedule:
         return None
-    minutes = dt.hour*60 + dt.minute
+    minutes = dt.hour * 60 + dt.minute
     weekday = dt.weekday()
     for r in schedule:
         days = r.get('days')
         start = r.get('start_min')
         end = r.get('end_min')
         free = r.get('free', False)
-        # day match
         if days is not None and weekday not in days:
             continue
-        # time match
         if start is None and end is None:
             return None if free else r.get('price_hkd')
         if start is not None and end is not None:
@@ -199,22 +465,30 @@ def price_for_datetime_from_schedule(schedule, dt):
     return None
 
 def extract_price_from_text_simple(text):
-    """
-    Only return a price if a leading '$' is present. Return numeric HKD float.
-    """
     if not text:
         return None
     t = str(text)
     if re.search(r'\b(free|no charge|complimentary|no fee|free of charge)\b', t, re.I):
-        return None  # represent free as None for numeric field; keep human 'Free' in remark if desired
+        return None
     m = _money_re.search(t)
     if m:
         amt = m.group('amt').replace(',', '')
         try:
             return float(amt)
-        except:
+        except Exception:
             return None
-    return None  # Do NOT fallback to numbers without $
+    return None
+
+def fetch_and_cache_info(use_cache=True):
+    cache_file = os.path.join(INFO_CACHE_DIR, "carpark_basic_info.json")
+    if use_cache and os.path.exists(cache_file):
+        with open(cache_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    r = get_with_retry(CARPARK_INFO_API, tries=3)
+    j = r.json()
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(j, f, ensure_ascii=False)
+    return j
 
 def extract_info_columns(rec):
     def get_any(keys):
@@ -247,13 +521,9 @@ def extract_info_columns(rec):
             carpark_photo = first
     elif isinstance(carpark_photo, dict):
         carpark_photo = carpark_photo.get("url") or carpark_photo.get("photoUrl") or json.dumps(carpark_photo, ensure_ascii=False)
-
     remark_en = get_any(["remark_en","remarkEn","remark","remarks","note_en","noteEn"])
-    # numeric HKD price (only if $ present)
     price_amount_hkd = extract_price_from_text_simple(remark_en)
-    # structured schedule (only entries with $ are included)
     price_schedule = parse_price_schedule(remark_en) if remark_en else []
-
     try:
         latitude = float(latitude) if latitude not in (None,"") else None
     except Exception:
@@ -262,10 +532,13 @@ def extract_info_columns(rec):
         longitude = float(longitude) if longitude not in (None,"") else None
     except Exception:
         longitude = None
-
-    # keep human-readable 'price' column as 'HK$<amt>' if present
-    price_str = f"HK${int(price_amount_hkd) if price_amount_hkd is not None and price_amount_hkd.is_integer() else price_amount_hkd}" if price_amount_hkd is not None else None
-
+    if price_amount_hkd is not None:
+        if float(price_amount_hkd).is_integer():
+            price_str = f"HK${int(price_amount_hkd)}"
+        else:
+            price_str = f"HK${price_amount_hkd}"
+    else:
+        price_str = None
     return {
         "park_id": str(park_id) if park_id is not None else None,
         "name_en": name_en,
@@ -288,24 +561,24 @@ def normalize_info_records(raw):
     if isinstance(raw, list):
         recs = raw
     elif isinstance(raw, dict):
-        for k in ("data","records","items","result"):
+        for k in ("data","records","items","result","carpark_info","carparks"):
             if k in raw and isinstance(raw[k], list):
                 recs = raw[k]; break
-        if not recs:
-            def find_largest(o):
-                best=[]
-                def _w(x):
-                    nonlocal best
-                    if isinstance(x, list):
-                        if len(x) > len(best) and all(isinstance(i, dict) for i in x[:10]):
-                            best = x
-                        for it in x:
-                            _w(it)
-                    elif isinstance(x, dict):
-                        for v in x.values():
-                            _w(v)
-                _w(o); return best
-            recs = find_largest(raw)
+    if not recs:
+        def find_largest(o):
+            best=[]
+            def _w(x):
+                nonlocal best
+                if isinstance(x, list):
+                    if len(x) > len(best) and all(isinstance(i, dict) for i in x[:10]):
+                        best = x
+                    for it in x:
+                        _w(it)
+                elif isinstance(x, dict):
+                    for v in x.values():
+                        _w(v)
+            _w(o); return best
+        recs = find_largest(raw)
     rows = []
     for r in recs:
         try:
@@ -319,7 +592,7 @@ def normalize_info_records(raw):
 
 def _guess_datetime_from_row(row):
     candidates = []
-    for c in ('timestamp','datetime','date_time','dateTime','recorded_at','time','date'):
+    for c in ('timestamp','datetime','date_time','dateTime','recorded_at','time','date','snapshot_requested_utc'):
         if c in row and pd.notna(row[c]):
             candidates.append((c, row[c]))
     if not candidates:
@@ -331,42 +604,48 @@ def _guess_datetime_from_row(row):
     if 'date' in row and 'time' in row and pd.notna(row.get('date')) and pd.notna(row.get('time')):
         try:
             return pd.to_datetime(f"{row['date']} {row['time']}")
-        except:
+        except Exception:
             pass
     for c, val in candidates:
         try:
             dt = pd.to_datetime(val, infer_datetime_format=True, utc=False, errors='coerce')
             if pd.notna(dt):
                 return pd.Timestamp(dt).to_pydatetime()
-        except:
+        except Exception:
             continue
     return None
 
-def merge_flattened_with_info(flatten_csv_path, info_df, dry_run=True, dry_limit=20):
-    if not Path(flatten_csv_path).exists():
-        raise FileNotFoundError(f"Flattened CSV not found: {flatten_csv_path}")
-    df_flat = pd.read_csv(flatten_csv_path, dtype=str)
+def build_merged_df(df_vacancy):
+    print("Normalizing vacancy `df`...")
+    df_flat = df_vacancy.copy()
+
     if "park_id" not in df_flat.columns:
         for alt in ("park_Id","parkId","carpark_id","park"):
             if alt in df_flat.columns:
-                df_flat["park_id"] = df_flat[alt].astype(str); break
-    if "park_id" not in df_flat.columns:
-        raise KeyError("Could not find park id in flattened CSV.")
-    if dry_run:
-        uniq = df_flat["park_id"].dropna().unique()[:dry_limit]
-        df_flat = df_flat[df_flat["park_id"].isin(uniq)].copy()
-        print(f"DRY_RUN: keeping {len(uniq)} park_ids")
+                df_flat = df_flat.rename(columns={alt: "park_id"})
+                break
+    df_flat["park_id"] = df_flat["park_id"].astype(str)
 
-    if "park_id" not in info_df.columns:
-        if "park_Id" in info_df.columns:
-            info_df = info_df.rename(columns={"park_Id":"park_id"})
+    if DRY_RUN:
+        uniq = df_flat["park_id"].dropna().unique()[:DRY_MAX_PARKS]
+        df_flat = df_flat[df_flat["park_id"].isin(uniq)].copy()
+        print(f"DRY_RUN: limited to {len(uniq)} car parks in merge step")
+
+    print("Fetching basic carpark info...")
+    raw_info = fetch_and_cache_info(use_cache=True)
+    info_df = normalize_info_records(raw_info)
+    print(f"Got info for {len(info_df)} car parks in info_df")
+
     merged = df_flat.merge(info_df, how="left", on="park_id", suffixes=("","_info"))
 
+    columns_needed = [
+        'park_id', 'name_en', 'displayAddress_en', 'latitude', 'longitude',
+        'district_en', 'contactNo', 'opening_status', 'carpark_photo', 'price'
+    ]
     for col in columns_needed:
         if col not in merged.columns:
             merged[col] = None
 
-    # compute price_at_record_time_hkd numeric where possible
     if 'price_schedule' in merged.columns:
         def _compute_price_at_row(row):
             ps_json = row.get('price_schedule')
@@ -387,65 +666,39 @@ def merge_flattened_with_info(flatten_csv_path, info_df, dry_run=True, dry_limit
     else:
         merged['price_at_record_time_hkd'] = None
 
-    # if price_amount_hkd exists from info, propagate to numeric column (ensure float)
     if 'price_amount_hkd' in merged.columns:
         def _to_float(x):
             try:
                 return float(x) if pd.notna(x) else None
-            except:
+            except Exception:
                 return None
         merged['price_amount_hkd'] = merged['price_amount_hkd'].apply(_to_float)
 
     remaining = [c for c in merged.columns if c not in columns_needed]
     merged = merged[columns_needed + remaining]
-    return merged
 
-# RUN
-if __name__ == '__main__':
-    print("Fetching basic carpark info (cached)...")
-    raw_info = fetch_and_cache_info(use_cache=True)
-    info_df = normalize_info_records(raw_info)
-    print("Info records:", len(info_df))
+    merged_df = merged.copy()
+    print(f"\nMerged complete! → merged_df has {len(merged_df):,} rows")
+    print(f"Car parks with pricing: {merged_df['price_amount_hkd'].notna().sum()}")
+    print(f"Rows with time-specific price: {merged_df['price_at_record_time_hkd'].notna().sum()}")
 
-    print("Merging with flattened CSV at:", FLATTENED_CSV_PATH)
-    merged_df = merge_flattened_with_info(FLATTENED_CSV_PATH, info_df, dry_run=DRY_RUN, dry_limit=DRY_MAX_PARKS)
-
-    #print("Merged rows:", len(merged_df))
-    #merged_df.to_csv(MERGED_CSV, index=False)
-    #print("Saved merged CSV to:", MERGED_CSV)
-
-    if "date" in merged_df.columns:
-        for d, sub in merged_df.groupby(merged_df["date"]):
-            safe = str(d).replace(" ", "_")
-            outp = os.path.join(PER_DAY_DIR, f"merged_{safe}.csv")
-            sub.to_csv(outp, index=False)
-        print("Saved per-day CSVs to:", PER_DAY_DIR)
+    return merged_df
 
 
-import os
-import json
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 
-SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
-SHEET_NAME = "data"   # 換成你要寫入的分頁名
-
+# upload dataFrame to Google Sheet
 def upload_dataframe_to_sheet(df):
-    # 從 Secrets 拿 OAuth 設定與 token
-    client_secret = json.loads(os.environ["GCP_CLIENT_SECRET_JSON"])
+    # 從 GitHub Secrets 取得 OAuth token
     token_data = json.loads(os.environ["GCP_TOKEN_JSON"])
-
     SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-    # 建立 Credentials 物件
     creds = Credentials.from_authorized_user_info(token_data, SCOPES)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
     service = build("sheets", "v4", credentials=creds)
 
-    # 先清空工作表
+    # 先清空工作表（這裡假設欄位不會超過 Z 欄）
     clear_range = f"{SHEET_NAME}!A:Z"
     service.spreadsheets().values().clear(
         spreadsheetId=SPREADSHEET_ID,
@@ -453,7 +706,7 @@ def upload_dataframe_to_sheet(df):
         body={}
     ).execute()
 
-    # 準備要寫入的資料：包含欄名 + 資料
+    # 用欄名 + 資料寫入
     values = [list(df.columns)] + df.astype(str).values.tolist()
     body = {"values": values}
 
@@ -465,5 +718,12 @@ def upload_dataframe_to_sheet(df):
         body=body
     ).execute()
 
-upload_dataframe_to_sheet(merged_df)
 
+
+# ========================= MAIN =========================
+if __name__ == "__main__":
+    vacancy_df = build_vacancy_df()
+    merged_df = build_merged_df(vacancy_df)
+    upload_dataframe_to_sheet(merged_df)
+    # 這裡可以加上輸出 CSV 或上傳 Google Sheet 的程式
+    # 例如：merged_df.to_csv("merged_df.csv", index=False)
