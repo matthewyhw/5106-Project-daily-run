@@ -3,7 +3,7 @@ import json
 import calendar
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 # -------------------- Config --------------------
 BASE_URL = "https://resource.data.one.gov.hk/td/carpark/vacancy_all.json"
