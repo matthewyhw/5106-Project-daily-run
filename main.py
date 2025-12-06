@@ -485,7 +485,8 @@ def fetch_and_cache_info(use_cache=True):
         with open(cache_file, "r", encoding="utf-8") as f:
             return json.load(f)
     r = get_with_retry(CARPARK_INFO_API, tries=3)
-    j = r.json()
+    text = r.content.decode("utf-8-sig")
+    j = json.loads(text)
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump(j, f, ensure_ascii=False)
     return j
