@@ -410,9 +410,9 @@ if __name__ == '__main__':
     print("Merging with flattened CSV at:", FLATTENED_CSV_PATH)
     merged_df = merge_flattened_with_info(FLATTENED_CSV_PATH, info_df, dry_run=DRY_RUN, dry_limit=DRY_MAX_PARKS)
 
-    print("Merged rows:", len(merged_df))
-    merged_df.to_csv(MERGED_CSV, index=False)
-    print("Saved merged CSV to:", MERGED_CSV)
+    #print("Merged rows:", len(merged_df))
+    #merged_df.to_csv(MERGED_CSV, index=False)
+    #print("Saved merged CSV to:", MERGED_CSV)
 
     if "date" in merged_df.columns:
         for d, sub in merged_df.groupby(merged_df["date"]):
@@ -420,3 +420,50 @@ if __name__ == '__main__':
             outp = os.path.join(PER_DAY_DIR, f"merged_{safe}.csv")
             sub.to_csv(outp, index=False)
         print("Saved per-day CSVs to:", PER_DAY_DIR)
+
+
+import os
+import json
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
+SHEET_NAME = "data"   # 換成你要寫入的分頁名
+
+def upload_dataframe_to_sheet(df):
+    # 從 Secrets 拿 OAuth 設定與 token
+    client_secret = json.loads(os.environ["GCP_CLIENT_SECRET_JSON"])
+    token_data = json.loads(os.environ["GCP_TOKEN_JSON"])
+
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    # 建立 Credentials 物件
+    creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    service = build("sheets", "v4", credentials=creds)
+
+    # 先清空工作表
+    clear_range = f"{SHEET_NAME}!A:Z"
+    service.spreadsheets().values().clear(
+        spreadsheetId=SPREADSHEET_ID,
+        range=clear_range,
+        body={}
+    ).execute()
+
+    # 準備要寫入的資料：包含欄名 + 資料
+    values = [list(df.columns)] + df.astype(str).values.tolist()
+    body = {"values": values}
+
+    write_range = f"{SHEET_NAME}!A1"
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=write_range,
+        valueInputOption="RAW",
+        body=body
+    ).execute()
+
+upload_dataframe_to_sheet(merged_df)
+
