@@ -23,4 +23,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run script
+        env:
+          GCP_CLIENT_SECRET_JSON: ${{ secrets.GCP_CLIENT_SECRET_JSON }}
+          GCP_TOKEN_JSON: ${{ secrets.GCP_TOKEN_JSON }}
         run: python main.py
