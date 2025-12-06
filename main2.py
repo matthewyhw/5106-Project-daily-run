@@ -622,3 +622,38 @@ for c in requested_cols:
         merged[c] = None
 
 df_enriched = merged[requested_cols].copy()
+
+# upload dataFrame to Google Sheet
+def upload_dataframe_to_sheet(df):
+    # 從 GitHub Secrets 取得 OAuth token
+    token_data = json.loads(os.environ["GCP_TOKEN_JSON"])
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    service = build("sheets", "v4", credentials=creds)
+
+    # Clear the worksheet (Column no more than ZZ)
+    clear_range = f"{SHEET_NAME}!A:ZZ"
+    service.spreadsheets().values().clear(
+        spreadsheetId=SPREADSHEET_ID,
+        range=clear_range,
+        body={}
+    ).execute()
+
+    # 用欄名 + 資料寫入
+    values = [list(df.columns)] + df.astype(str).values.tolist()
+    body = {"values": values}
+
+    write_range = f"{SHEET_NAME}!A1"
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=write_range,
+        valueInputOption="RAW",
+        body=body
+    ).execute()
+
+
+upload_dataframe_to_sheet(df_enriched)
