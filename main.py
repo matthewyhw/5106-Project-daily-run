@@ -420,10 +420,3 @@ if __name__ == '__main__':
             outp = os.path.join(PER_DAY_DIR, f"merged_{safe}.csv")
             sub.to_csv(outp, index=False)
         print("Saved per-day CSVs to:", PER_DAY_DIR)
-
-    print("Sample merged rows (first 10):")
-    try:
-        from IPython.display import display
-        display(merged_df.head(10))
-    except Exception:
-        print(merged_df.head(10).to_string(index=False))
