@@ -2,7 +2,7 @@ name: run main.py daily
 
 on:
   schedule:
-    - cron: '11 00 * * *'   # UTC time 16:00
+    - cron: '0 11 * * *'   # UTC time 16:00
   workflow_dispatch:        # 允許你手動按鈕觸發
 
 jobs:
