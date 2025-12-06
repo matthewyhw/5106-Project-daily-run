@@ -699,8 +699,8 @@ def upload_dataframe_to_sheet(df):
 
     service = build("sheets", "v4", credentials=creds)
 
-    # 先清空工作表（這裡假設欄位不會超過 Z 欄）
-    clear_range = f"{SHEET_NAME}!A:Z"
+    # Clear the worksheet (Column no more than ZZ)
+    clear_range = f"{SHEET_NAME}!A:ZZ"
     service.spreadsheets().values().clear(
         spreadsheetId=SPREADSHEET_ID,
         range=clear_range,
