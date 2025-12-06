@@ -1,3 +1,4 @@
 pandas
 requests
-gspread gspread-dataframe
+gspread
+gspread-dataframe
