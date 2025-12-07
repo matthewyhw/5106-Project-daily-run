@@ -21,6 +21,8 @@ LIMIT_SNAPSHOTS = 48       # only used when DRY_RUN=True
 # HKT handling (fixed offset, no DST)
 HKT_OFFSET = timedelta(hours=8)
 
+SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
+SHEET_NAME = "data"
 # -------------------- Time generation (HKT → UTC) --------------------
 def month_start_end_hkt(year: int, month: int):
     days = calendar.monthrange(year, month)[1]
