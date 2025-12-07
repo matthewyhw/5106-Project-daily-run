@@ -4,6 +4,12 @@ import pandas as pd
 from datetime import datetime, timedelta, date
 from urllib.parse import quote
 import re
+from pathlib import Path
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from google_auth_httplib2 import AuthorizedHttp
+import httplib2
 
 # -------------------- Config --------------------
 SOURCE_FILE_ID = "https://resource.data.one.gov.hk/td/carpark/vacancy_all.json"
@@ -19,7 +25,8 @@ PAST_DAYS = 2              # positive int for past N days (excluding today); 0/N
 # HKT handling (fixed UTC+8, no DST)
 HKT_OFFSET = timedelta(hours=8)
 
-
+SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
+SHEET_NAME = "data"
 # -------------------- Time generation (HKT → UTC) --------------------
 def month_start_end_hkt(year: int, month: int):
     days = calendar.monthrange(year, month)[1]
@@ -372,6 +379,10 @@ if not df.empty:
 
 df = df[df['vehicle_type']=='P']
 
+
+
+# ------------------- Part two - Merging with car park basic info and public holiday ------------
+
 BASIC_INFO_URL = "https://resource.data.one.gov.hk/td/carpark/basic_info_all.json"
 HOLIDAY_URL = "https://www.1823.gov.hk/common/ical/en.json"
 
@@ -629,3 +640,39 @@ for c in requested_cols:
 # Final enriched dataframe, overwriting df as requested
 df = merged[requested_cols]
 
+# upload dataFrame to Google Sheet
+def upload_dataframe_to_sheet(df):
+    # 從 GitHub Secrets 取得 OAuth token
+    token_data = json.loads(os.environ["GCP_TOKEN_JSON"])
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    http = httplib2.Http(timeout=600)  # 600 seconds timeout
+    authed_http = AuthorizedHttp(creds, http=http)
+    service = build("sheets", "v4", http=authed_http, cache_discovery=False)
+
+    # Clear the worksheet (Column no more than ZZ)
+    clear_range = f"{SHEET_NAME}!A:ZZ"
+    service.spreadsheets().values().clear(
+        spreadsheetId=SPREADSHEET_ID,
+        range=clear_range,
+        body={}
+    ).execute()
+
+    # 用欄名 + 資料寫入
+    values = [list(df.columns)] + df.astype(str).values.tolist()
+    body = {"values": values}
+
+    write_range = f"{SHEET_NAME}!A1"
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=write_range,
+        valueInputOption="RAW",
+        body=body
+    ).execute()
+
+
+upload_dataframe_to_sheet(df)
