@@ -5,6 +5,10 @@ import os
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, date
+from pathlib import Path
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 # -------------------- Config --------------------
 BASE_URL = "https://resource.data.one.gov.hk/td/carpark/vacancy_all.json"
