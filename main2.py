@@ -9,6 +9,7 @@ from pathlib import Path
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+import httplib2
 
 # -------------------- Config --------------------
 BASE_URL = "https://resource.data.one.gov.hk/td/carpark/vacancy_all.json"
@@ -20,6 +21,8 @@ LIMIT_SNAPSHOTS = 48       # only used when DRY_RUN=True
 
 # HKT handling (fixed offset, no DST)
 HKT_OFFSET = timedelta(hours=8)
+
+http = httplib2.Http(timeout=600)    # set the timeout time to 10min
 
 SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
 SHEET_NAME = "data"
