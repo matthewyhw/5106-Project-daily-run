@@ -21,7 +21,7 @@ TARGET_MONTH = 11          # 1..12 for a specific month, or 0/None for whole yea
 INTERVAL_MINUTES = 60      # 1 hour
 DRY_RUN = False
 LIMIT_SNAPSHOTS = 48       # used only when DRY_RUN=True
-PAST_DAYS = 2              # positive int for past N days (excluding today); 0/None disables
+PAST_DAYS = 28             # positive int for past N days (excluding today); 0/None disables
 
 # HKT handling (fixed UTC+8, no DST)
 HKT_OFFSET = timedelta(hours=8)
