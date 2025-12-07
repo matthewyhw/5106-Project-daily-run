@@ -13,7 +13,7 @@ import httplib2
 
 # -------------------- Config --------------------
 BASE_URL = "https://resource.data.one.gov.hk/td/carpark/vacancy_all.json"
-YEAR = 2024
+YEAR = 2025
 TARGET_MONTH = 11          # 1..12 for a specific month, or 0 for whole year
 INTERVAL_MINUTES = 60      # 1 hour
 DRY_RUN = False             # Set to False for full run
@@ -21,8 +21,6 @@ LIMIT_SNAPSHOTS = 48       # only used when DRY_RUN=True
 
 # HKT handling (fixed offset, no DST)
 HKT_OFFSET = timedelta(hours=8)
-
-http = httplib2.Http(timeout=600)    # set the timeout time to 10min
 
 SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
 SHEET_NAME = "data"
@@ -643,7 +641,9 @@ def upload_dataframe_to_sheet(df):
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
-    service = build("sheets", "v4", credentials=creds)
+    http = httplib2.Http(timeout=600)  # 60 秒 timeout
+    authed_http = AuthorizedHttp(creds, http=http)
+    service = build("sheets", "v4", http=authed_http, cache_discovery=False)
 
     # Clear the worksheet (Column no more than ZZ)
     clear_range = f"{SHEET_NAME}!A:ZZ"
