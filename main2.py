@@ -623,6 +623,7 @@ for c in requested_cols:
         merged[c] = None
 
 df_enriched = merged[requested_cols].copy()
+df_enriched = df_enriched[df_enriched['vehicle_type']=='P']
 
 # upload dataFrame to Google Sheet
 def upload_dataframe_to_sheet(df):
