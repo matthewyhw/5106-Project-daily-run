@@ -26,4 +26,4 @@ jobs:
         env:
           GCP_CLIENT_SECRET_JSON: ${{ secrets.GCP_CLIENT_SECRET_JSON }}
           GCP_TOKEN_JSON: ${{ secrets.GCP_TOKEN_JSON }}
-        run: python main2.py
+        run: python main3.py
