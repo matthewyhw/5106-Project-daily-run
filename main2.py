@@ -9,15 +9,18 @@ from pathlib import Path
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from google_auth_httplib2 import AuthorizedHttp
 import httplib2
 
 # -------------------- Config --------------------
 BASE_URL = "https://resource.data.one.gov.hk/td/carpark/vacancy_all.json"
-YEAR = 2025
-TARGET_MONTH = 11          # 1..12 for a specific month, or 0 for whole year
+#YEAR = 2025
+#TARGET_MONTH = 11          # 1..12 for a specific month, or 0 for whole year
 INTERVAL_MINUTES = 60      # 1 hour
 DRY_RUN = False             # Set to False for full run
 LIMIT_SNAPSHOTS = 48       # only used when DRY_RUN=True
+
+PAST_DAYS = 28             # <- 新增：往前推幾天（含今天）
 
 # HKT handling (fixed offset, no DST)
 HKT_OFFSET = timedelta(hours=8)
@@ -25,55 +28,43 @@ HKT_OFFSET = timedelta(hours=8)
 SPREADSHEET_ID = "1KsHTcbvVRR9w252DW3vfabRu5iUf-HEvzp4CeWs2UAk"
 SHEET_NAME = "data"
 # -------------------- Time generation (HKT → UTC) --------------------
-def month_start_end_hkt(year: int, month: int):
-    days = calendar.monthrange(year, month)[1]
-    start = datetime(year, month, 1, 0, 0, 0)
-    end = datetime(year, month, days, 23, 0, 0)  # last day 23:00 HKT inclusive
-    return start, end
-
-
-def generate_hourly_hkt_range(year: int, target_month: int | None = None, interval_minutes: int = 60):
+def generate_past_days_hkt_range(past_days: int, interval_minutes: int = 60):
     """
-    Yield UTC datetimes corresponding to HKT-local scheduled timestamps.
-    If target_month is None/0: full year. Else: only that month.
+    由「現在的 HKT」往前推 past_days 天，產生等間隔時間點（HKT），再轉成 UTC 輸出。
+    例如 past_days=28，代表 [now-27天, now] 這 28 天內。
     """
-    ranges = []
-    if target_month and 1 <= target_month <= 12:
-        s_hkt, e_hkt = month_start_end_hkt(year, target_month)
-        ranges.append((s_hkt, e_hkt))
-    else:
-        for m in range(1, 13):
-            s_hkt, e_hkt = month_start_end_hkt(year, m)
-            ranges.append((s_hkt, e_hkt))
+    # 取現在的 HKT（先用 UTC now，再加 8 小時）
+    now_utc = datetime.utcnow()
+    now_hkt = now_utc + HKT_OFFSET
 
-    # For each range, step from start to end inclusive at interval
-    for s_hkt, e_hkt in ranges:
-        cur = s_hkt
-        while cur <= e_hkt:
-            yield cur - HKT_OFFSET  # convert to UTC (naive)
-            cur += timedelta(minutes=interval_minutes)
+    # 起點：past_days-1 天前的同一個小時（向下取整到小時）
+    start_hkt = (now_hkt - timedelta(days=past_days - 1)).replace(minute=0, second=0, microsecond=0)
+    end_hkt = now_hkt.replace(minute=0, second=0, microsecond=0)
+
+    cur = start_hkt
+    while cur <= end_hkt:
+        yield cur - HKT_OFFSET  # 轉回 UTC（naive）
+        cur += timedelta(minutes=interval_minutes)
 
 
 def get_timestamps(
-    year=YEAR,
-    month=TARGET_MONTH,
-    interval_minutes=INTERVAL_MINUTES,
-    dry_run=DRY_RUN,
-    limit=LIMIT_SNAPSHOTS,
+    past_days: int = PAST_DAYS,
+    interval_minutes: int = INTERVAL_MINUTES,
+    dry_run: bool = DRY_RUN,
+    limit: int = LIMIT_SNAPSHOTS,
 ):
-    all_ts = list(generate_hourly_hkt_range(year, month if month else None, interval_minutes))
+    all_ts = list(generate_past_days_hkt_range(past_days, interval_minutes))
     if dry_run:
         return all_ts[-limit:]
     return all_ts
 
 
 def dry_run_preview(
-    year=YEAR,
-    month=TARGET_MONTH,
-    interval_minutes=INTERVAL_MINUTES,
-    limit=LIMIT_SNAPSHOTS,
+    past_days: int = PAST_DAYS,
+    interval_minutes: int = INTERVAL_MINUTES,
+    limit: int = LIMIT_SNAPSHOTS,
 ):
-    ts = get_timestamps(year, month, interval_minutes, dry_run=True, limit=limit)
+    ts = get_timestamps(past_days=past_days, interval_minutes=interval_minutes, dry_run=True, limit=limit)
     print(f"Dry run: returning {len(ts)} timestamps (last {limit} samples)")
     if ts:
         first_hkt = ts[0] + HKT_OFFSET
@@ -86,9 +77,11 @@ def dry_run_preview(
         )
     return ts
 
+
 # -------------------- Networking helpers --------------------
 session = requests.Session()
 session.headers.update({"User-Agent": "python-carpark-collector/1.0"})
+
 
 def get_with_retry(url, params=None, timeout=30, tries=3, backoff=1.0):
     last_exc = None
@@ -162,13 +155,11 @@ def try_wayback(ts: datetime) -> str | None:
 
 
 def fetch_snapshot(ts: datetime) -> str | None:
-    """
-    無快取版本：每次都直接打 API / Wayback，只保留在記憶體。
-    """
     txt = try_direct_api(ts)
     if not txt:
         txt = try_wayback(ts)
     return txt
+
 
 # -------------------- Flattening --------------------
 def flatten_carpark_record(rec: dict, snapshot_ts: datetime):
@@ -286,9 +277,10 @@ def flatten_carpark_record(rec: dict, snapshot_ts: datetime):
             )
     return rows
 
+
 # -------------------- Main --------------------
-timestamps = get_timestamps(YEAR, TARGET_MONTH, INTERVAL_MINUTES, DRY_RUN, LIMIT_SNAPSHOTS)
-print(f"Timestamps to fetch: {len(timestamps)} (DRY_RUN={DRY_RUN})")
+timestamps = get_timestamps()
+print(f"Timestamps to fetch: {len(timestamps)} (DRY_RUN={DRY_RUN}, PAST_DAYS={PAST_DAYS})")
 
 all_rows = []
 failed = []
@@ -361,7 +353,7 @@ for ts in timestamps:
         except Exception:
             continue
 
-# Build final DataFrame `df`（不輸出 CSV、不寫檔）
+# Build final DataFrame `df`
 df = pd.DataFrame(all_rows)
 
 if df.empty:
@@ -371,8 +363,9 @@ else:
     df["snapshot_requested_hkt"] = df["snapshot_requested_utc"] + HKT_OFFSET
     df["date_hkt"] = df["snapshot_requested_hkt"].dt.date
     df["time_hkt"] = df["snapshot_requested_hkt"].dt.strftime("%H:%M:%S")
-    df["year"] = YEAR
-    df["month"] = TARGET_MONTH if TARGET_MONTH else None
+    # 不再有固定 YEAR / TARGET_MONTH，就直接從 date 拆
+    df["year"] = df["snapshot_requested_hkt"].dt.year
+    df["month"] = df["snapshot_requested_hkt"].dt.month
 
     print("Rows:", len(df), "| Unique HKT dates:", df["date_hkt"].nunique())
 
